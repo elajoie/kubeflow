@@ -1,0 +1,382 @@
+"""
+Kubeflow Pipelines v2 Example with Pipeline Push Support
+
+This example demonstrates:
+1. Creating KFP v2 components
+2. Building a pipeline
+3. Compiling the pipeline
+4. Pushing/uploading the pipeline to Kubeflow
+"""
+
+from kfp import dsl
+from kfp import compiler
+from kfp.client import Client
+import os
+from typing import NamedTuple
+
+
+# ============================================================================
+# Define Components using KFP v2 syntax
+# ============================================================================
+
+@dsl.component(
+    base_image="python:3.9",
+    packages_to_install=["pandas", "scikit-learn"]
+)
+def load_data(data_path: str) -> NamedTuple("Outputs", [("dataset", dsl.Dataset), ("num_rows", int)]):
+    """Load and prepare dataset"""
+    import pandas as pd
+    from collections import namedtuple
+    
+    # Simulate loading data
+    df = pd.DataFrame({
+        'feature1': [1, 2, 3, 4, 5],
+        'feature2': [2, 4, 6, 8, 10],
+        'target': [0, 1, 0, 1, 0]
+    })
+    
+    # Save dataset
+    output_path = "/tmp/dataset.csv"
+    df.to_csv(output_path, index=False)
+    
+    outputs = namedtuple("Outputs", ["dataset", "num_rows"])
+    return outputs(output_path, len(df))
+
+
+@dsl.component(
+    base_image="python:3.9",
+    packages_to_install=["pandas", "scikit-learn"]
+)
+def preprocess_data(
+    dataset: dsl.Input[dsl.Dataset],
+    test_size: float = 0.2
+) -> NamedTuple("Outputs", [("train_data", dsl.Dataset), ("test_data", dsl.Dataset)]):
+    """Preprocess and split data"""
+    import pandas as pd
+    from sklearn.model_selection import train_test_split
+    from collections import namedtuple
+    
+    # Load data
+    df = pd.read_csv(dataset.path)
+    
+    # Split data
+    train_df, test_df = train_test_split(df, test_size=test_size, random_state=42)
+    
+    # Save splits
+    train_path = "/tmp/train_data.csv"
+    test_path = "/tmp/test_data.csv"
+    train_df.to_csv(train_path, index=False)
+    test_df.to_csv(test_path, index=False)
+    
+    outputs = namedtuple("Outputs", ["train_data", "test_data"])
+    return outputs(train_path, test_path)
+
+
+@dsl.component(
+    base_image="python:3.9",
+    packages_to_install=["pandas", "scikit-learn"]
+)
+def train_model(
+    train_data: dsl.Input[dsl.Dataset],
+    model_output: dsl.Output[dsl.Model],
+    learning_rate: float = 0.01
+) -> NamedTuple("Outputs", [("accuracy", float)]):
+    """Train a simple model"""
+    import pandas as pd
+    from sklearn.linear_model import LogisticRegression
+    import pickle
+    from collections import namedtuple
+    
+    # Load training data
+    df = pd.read_csv(train_data.path)
+    X = df[['feature1', 'feature2']]
+    y = df['target']
+    
+    # Train model
+    model = LogisticRegression(random_state=42)
+    model.fit(X, y)
+    
+    # Calculate accuracy
+    accuracy = model.score(X, y)
+    
+    # Save model
+    with open(model_output.path, 'wb') as f:
+        pickle.dump(model, f)
+    
+    outputs = namedtuple("Outputs", ["accuracy"])
+    return outputs(accuracy)
+
+
+@dsl.component(
+    base_image="python:3.9",
+    packages_to_install=["pandas", "scikit-learn"]
+)
+def evaluate_model(
+    model: dsl.Input[dsl.Model],
+    test_data: dsl.Input[dsl.Dataset]
+) -> NamedTuple("Outputs", [("test_accuracy", float), ("num_predictions", int)]):
+    """Evaluate the trained model"""
+    import pandas as pd
+    import pickle
+    from collections import namedtuple
+    
+    # Load model
+    with open(model.path, 'rb') as f:
+        loaded_model = pickle.load(f)
+    
+    # Load test data
+    df = pd.read_csv(test_data.path)
+    X = df[['feature1', 'feature2']]
+    y = df['target']
+    
+    # Evaluate
+    test_accuracy = loaded_model.score(X, y)
+    num_predictions = len(df)
+    
+    outputs = namedtuple("Outputs", ["test_accuracy", "num_predictions"])
+    return outputs(test_accuracy, num_predictions)
+
+
+# ============================================================================
+# Define Pipeline
+# ============================================================================
+
+@dsl.pipeline(
+    name="ml-training-pipeline-v2",
+    description="A sample ML pipeline using KFP v2 SDK"
+)
+def ml_pipeline(
+    data_path: str = "gs://my-bucket/data.csv",
+    test_size: float = 0.2,
+    learning_rate: float = 0.01
+):
+    """
+    ML Pipeline that loads data, preprocesses, trains, and evaluates a model
+    """
+    
+    # Step 1: Load data
+    load_data_task = load_data(data_path=data_path)
+    
+    # Step 2: Preprocess data
+    preprocess_task = preprocess_data(
+        dataset=load_data_task.outputs["dataset"],
+        test_size=test_size
+    )
+    
+    # Step 3: Train model
+    train_task = train_model(
+        train_data=preprocess_task.outputs["train_data"],
+        learning_rate=learning_rate
+    )
+    
+    # Step 4: Evaluate model
+    evaluate_task = evaluate_model(
+        model=train_task.outputs["model_output"],
+        test_data=preprocess_task.outputs["test_data"]
+    )
+    
+    # You can set task dependencies, resource requests, etc.
+    # train_task.set_cpu_limit('2')
+    # train_task.set_memory_limit('4G')
+
+
+# ============================================================================
+# Compile Pipeline
+# ============================================================================
+
+def compile_pipeline(output_file: str = "pipeline.yaml"):
+    """Compile the pipeline to YAML"""
+    compiler.Compiler().compile(
+        pipeline_func=ml_pipeline,
+        package_path=output_file
+    )
+    print(f"Pipeline compiled successfully to {output_file}")
+
+
+# ============================================================================
+# Push Pipeline to Kubeflow
+# ============================================================================
+
+def push_pipeline_to_kubeflow(
+    pipeline_file: str = "pipeline.yaml",
+    kubeflow_endpoint: str = None,
+    pipeline_name: str = "ml-training-pipeline-v2",
+    pipeline_description: str = "ML Training Pipeline using KFP v2"
+):
+    """
+    Push/upload the compiled pipeline to Kubeflow
+    
+    Args:
+        pipeline_file: Path to the compiled pipeline YAML file
+        kubeflow_endpoint: Kubeflow endpoint URL (e.g., 'http://localhost:8080')
+        pipeline_name: Name for the pipeline in Kubeflow
+        pipeline_description: Description of the pipeline
+    """
+    
+    # Initialize Kubeflow client
+    # Option 1: Use default endpoint (looks for endpoint in environment)
+    # client = Client()
+    
+    # Option 2: Specify endpoint explicitly
+    if kubeflow_endpoint:
+        client = Client(host=kubeflow_endpoint)
+    else:
+        # Try to get from environment or use default
+        client = Client()
+    
+    try:
+        # Upload pipeline
+        pipeline = client.upload_pipeline(
+            pipeline_package_path=pipeline_file,
+            pipeline_name=pipeline_name,
+            description=pipeline_description
+        )
+        
+        print(f"Pipeline uploaded successfully!")
+        print(f"Pipeline ID: {pipeline.id}")
+        print(f"Pipeline Name: {pipeline.name}")
+        
+        return pipeline
+        
+    except Exception as e:
+        print(f"Error uploading pipeline: {e}")
+        raise
+
+
+# ============================================================================
+# Create and Run Pipeline
+# ============================================================================
+
+def create_and_run_pipeline(
+    kubeflow_endpoint: str = None,
+    experiment_name: str = "ml-experiments",
+    run_name: str = "ml-pipeline-run",
+    pipeline_params: dict = None
+):
+    """
+    Compile, upload, and run the pipeline
+    
+    Args:
+        kubeflow_endpoint: Kubeflow endpoint URL
+        experiment_name: Name of the experiment
+        run_name: Name for this pipeline run
+        pipeline_params: Dictionary of pipeline parameters
+    """
+    
+    # Default parameters
+    if pipeline_params is None:
+        pipeline_params = {
+            "data_path": "gs://my-bucket/data.csv",
+            "test_size": 0.2,
+            "learning_rate": 0.01
+        }
+    
+    # Step 1: Compile pipeline
+    pipeline_file = "pipeline.yaml"
+    compile_pipeline(pipeline_file)
+    
+    # Step 2: Initialize client
+    if kubeflow_endpoint:
+        client = Client(host=kubeflow_endpoint)
+    else:
+        client = Client()
+    
+    # Step 3: Upload pipeline
+    pipeline = push_pipeline_to_kubeflow(
+        pipeline_file=pipeline_file,
+        kubeflow_endpoint=kubeflow_endpoint
+    )
+    
+    # Step 4: Create or get experiment
+    try:
+        experiment = client.create_experiment(name=experiment_name)
+        print(f"Created experiment: {experiment.name}")
+    except Exception:
+        experiment = client.get_experiment(experiment_name=experiment_name)
+        print(f"Using existing experiment: {experiment.name}")
+    
+    # Step 5: Create a run
+    run = client.run_pipeline(
+        experiment_id=experiment.id,
+        job_name=run_name,
+        pipeline_id=pipeline.id,
+        params=pipeline_params
+    )
+    
+    print(f"\nPipeline run created successfully!")
+    print(f"Run ID: {run.id}")
+    print(f"Run Name: {run.name}")
+    print(f"Check the Kubeflow UI for run status")
+    
+    return run
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def list_pipelines(kubeflow_endpoint: str = None):
+    """List all pipelines in Kubeflow"""
+    if kubeflow_endpoint:
+        client = Client(host=kubeflow_endpoint)
+    else:
+        client = Client()
+    
+    pipelines = client.list_pipelines()
+    
+    print("Available Pipelines:")
+    for pipeline in pipelines.pipelines:
+        print(f"  - {pipeline.name} (ID: {pipeline.id})")
+
+
+def delete_pipeline(pipeline_id: str, kubeflow_endpoint: str = None):
+    """Delete a pipeline from Kubeflow"""
+    if kubeflow_endpoint:
+        client = Client(host=kubeflow_endpoint)
+    else:
+        client = Client()
+    
+    client.delete_pipeline(pipeline_id)
+    print(f"Pipeline {pipeline_id} deleted successfully")
+
+
+# ============================================================================
+# Main Execution
+# ============================================================================
+
+if __name__ == "__main__":
+    # Configuration
+    KUBEFLOW_ENDPOINT = os.getenv("KUBEFLOW_ENDPOINT", "http://localhost:8080")
+    
+    # Example 1: Just compile the pipeline
+    print("=== Compiling Pipeline ===")
+    compile_pipeline("pipeline.yaml")
+    
+    # Example 2: Upload pipeline to Kubeflow
+    print("\n=== Uploading Pipeline to Kubeflow ===")
+    # Uncomment to run:
+    # push_pipeline_to_kubeflow(
+    #     pipeline_file="pipeline.yaml",
+    #     kubeflow_endpoint=KUBEFLOW_ENDPOINT
+    # )
+    
+    # Example 3: Compile, upload, and run pipeline
+    print("\n=== Complete Pipeline Execution ===")
+    # Uncomment to run:
+    # create_and_run_pipeline(
+    #     kubeflow_endpoint=KUBEFLOW_ENDPOINT,
+    #     experiment_name="my-ml-experiment",
+    #     run_name="test-run-001",
+    #     pipeline_params={
+    #         "data_path": "gs://my-bucket/data.csv",
+    #         "test_size": 0.3,
+    #         "learning_rate": 0.05
+    #     }
+    # )
+    
+    print("\n✓ Pipeline code generated successfully!")
+    print("\nTo use this code:")
+    print("1. Install dependencies: pip install kfp")
+    print("2. Set KUBEFLOW_ENDPOINT environment variable")
+    print("3. Uncomment the desired example in __main__")
+    print("4. Run: python kfp_v2_pipeline.py")
